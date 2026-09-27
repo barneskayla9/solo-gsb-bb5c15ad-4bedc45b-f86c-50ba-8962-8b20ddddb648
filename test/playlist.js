@@ -1,0 +1,397 @@
+/* 复盘播放清单测试：
+ *   一、清单文档规范化（去重 / 坏记录跳过 / 单例 id）
+ *   二、播放前重定位 resolveEntries：批注缺失 / 日志缺失 / 指纹失效跳过并列原因；
+ *       正常条目成段且严格保持清单顺序（重叠区间分别成段，不合并）
+ *   三、resolvePlaylist 装配器：模拟只读 GET 缓存（含跨场次、日志缺失）
+ *   四、虚拟时间轴纯函数：累计偏移、1×/2×/4× 无关的线性映射、
+ *       恰好落在边界进入后一段、零长段显式定位、拖动 clamp、跨段映射原场次时刻
+ *   五、段内事件行边界 cutoffIndex / eventVt：段起点只到起点锚点、段末不越过
+ *       终点锚点（同毫秒事件簇按日志行序截断）、pinnedIndex 定位同毫秒具体事件
+ *   六、清单读写事务：加入 / 移除 / 排序在同一 IndexedDB 读写事务内
+ *       读当前清单并提交，两个标签页（两条连接）并发增删排序不丢项、不重复
+ *   七、页面只读性（HTTP GET 静态页，无 WebSocket、无写接口）
+ *
+ * 运行前提：服务已在 localhost:3000 启动（npm start）。
+ */
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const http = require('http');
+const crypto = require('crypto');
+
+// 第五部分需要在 Node 内提供 IndexedDB：fake-indexeddb 仅为开发期 devDependency
+// （生产镜像 npm ci --omit=dev 不含），清单本体在浏览器中仍只存浏览器本地库
+const fakeIDB = require('fake-indexeddb');
+global.indexedDB = fakeIDB.indexedDB;
+global.IDBKeyRange = fakeIDB.IDBKeyRange;
+
+let passed = 0, failed = 0;
+function check(name, cond) {
+  if (cond) { passed++; console.log(`  ✔ ${name}`); }
+  else { failed++; console.log(`  ✘ ${name}`); }
+}
+
+// 与 test/annotations.js 同一方式把浏览器脚本装入 Node
+function loadBrowserModule(file, factoryName) {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'public', file), 'utf8');
+  const withoutExport = src.replace(/\nif \(typeof module[\s\S]*$/, '');
+  const fn = new Function('crypto', 'TextEncoder',
+    withoutExport.replace(`const ${factoryName} = (() => {`, 'return (() => {'));
+  return fn(crypto, TextEncoder);
+}
+
+const A = loadBrowserModule('annotations.js', 'CueAnnotations');
+globalThis.CueAnnotations = A; // resolvePlaylist 经 globalThis.CueAnnotations 访问
+const P = loadBrowserModule('playlist.js', 'CuePlaylist');
+
+function httpGet(urlPath) {
+  return new Promise((resolve, reject) => {
+    http.get(`http://localhost:3000${urlPath}`, (res) => {
+      let buf = '';
+      res.on('data', (c) => { buf += c; });
+      res.on('end', () => {
+        let json = null;
+        try { json = buf ? JSON.parse(buf) : null; } catch { json = null; }
+        resolve({ status: res.statusCode, body: buf, json });
+      });
+    }).on('error', reject);
+  });
+}
+function getPage(p) {
+  return new Promise((resolve, reject) => {
+    http.get(`http://localhost:3000${p}`, (res) => {
+      let b = ''; res.on('data', (c) => { b += c; });
+      res.on('end', () => resolve({ status: res.statusCode, body: b }));
+    }).on('error', reject);
+  });
+}
+
+function ev(ts, t, event, detail) { return { ts, t, event, detail: detail || {} }; }
+function makeEvents(startMs, cueText) {
+  const iso = (ms) => new Date(Date.parse('2026-09-19T10:00:00.000Z') + startMs + ms).toISOString();
+  return [
+    ev(iso(0), 0, 'session-start', {}),
+    ev(iso(1000), 1000, 'cue-started', { seq: 1, text: cueText || '口令甲', targets: ['灯光'] }),
+    ev(iso(2000), 2000, 'confirm', { seq: 1, position: '灯光' }),
+    ev(iso(3000), 3000, 'cue-completed', { seq: 1 }),
+    ev(iso(5000), 5000, 'sequence-finished', {}),
+  ];
+}
+
+async function main() {
+  const eventsA = makeEvents(0);
+  const eventsB = makeEvents(100000, '口令乙');
+  const SESSION_A = { fileId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', runId: 0 };
+  const SESSION_B = { fileId: 'ffffffff-0000-1111-2222-333333333333', runId: 2 };
+
+  const tableA = await A.buildOccurrenceTable(eventsA);
+  const tableB = await A.buildOccurrenceTable(eventsB);
+  const annA = await A.buildAnnotation({ events: eventsA, sessionRef: SESSION_A, startIndex: 1, endIndex: 3, text: '甲区间', tags: ['灯光'] });
+  const annB = await A.buildAnnotation({ events: eventsB, sessionRef: SESSION_B, startIndex: 2, endIndex: 4, text: '乙区间', tags: [] });
+  // 与 annA 重叠（甚至包含关系）的另一条批注：播放时必须各自成段、顺序播放
+  const annOverlap = await A.buildAnnotation({ events: eventsA, sessionRef: SESSION_A, startIndex: 1, endIndex: 2, text: '重叠区间', tags: [] });
+  // 零长区间（同一事件起止）
+  const annZero = await A.buildAnnotation({ events: eventsA, sessionRef: SESSION_A, startIndex: 2, endIndex: 2, text: '零长区间', tags: [] });
+  // 注定失效的批注（篡改日志后指纹消失）
+  const annDead = await A.buildAnnotation({
+    events: eventsA.map((e, i) => i === 1 ? { ...e, detail: { ...e.detail, text: '另一个口令' } } : e),
+    sessionRef: SESSION_A, startIndex: 1, endIndex: 3, text: '将失效', tags: [],
+  });
+
+  console.log('一、清单文档规范化');
+  check('空文档为单例 main / entries 空数组', P.emptyDoc().id === 'main' && Array.isArray(P.emptyDoc().entries));
+  const norm = P.normalizeDoc({
+    id: 'main',
+    entries: [
+      { id: annA.id, addedAt: '2026-09-19T10:00:00.000Z' },
+      { id: annA.id }, // 重复 id 去重
+      { id: annB.id },
+      { id: '' }, { no: 'id' }, null, 'x',
+    ],
+  });
+  check('重复 / 非法条目被剔除且保序', norm.entries.length === 2 && norm.entries[0].id === annA.id && norm.entries[1].id === annB.id);
+  check('缺 addedAt 补 ISO 字符串', typeof norm.entries[1].addedAt === 'string');
+  check('非对象输入回退空文档', P.normalizeDoc(null).entries.length === 0 && P.normalizeDoc('x').entries.length === 0);
+  check('makeEntry 含 id 与 addedAt', P.makeEntry('xyz').id === 'xyz' && !!P.makeEntry('xyz').addedAt);
+
+  console.log('二、resolveEntries：跳过原因集中给出，成段严格保序且不合并');
+  const entries = [{ id: annA.id }, { id: annB.id }, { id: annOverlap.id }, { id: annZero.id }, { id: annDead.id }, { id: 'missing-id' }];
+  const annotationMap = new Map([annA, annB, annOverlap, annZero, annDead].map((x) => [x.id, x]));
+  const resolvedMap = new Map([
+    [annA.id, { ok: true, events: eventsA, startIndex: 1, endIndex: 3 }],
+    [annB.id, { ok: true, events: eventsB, startIndex: 2, endIndex: 4 }],
+    [annOverlap.id, { ok: true, events: eventsA, startIndex: 1, endIndex: 2 }],
+    [annZero.id, { ok: true, events: eventsA, startIndex: 2, endIndex: 2 }],
+    [annDead.id, { ok: false, reason: '起点指纹事件在重载后的日志中找不到（日志可能已变更）' }],
+  ]);
+  const r = P.resolveEntries(entries, annotationMap, resolvedMap);
+  check('4 条成段（含零长段），顺序与清单一致',
+    r.segments.length === 4 &&
+    r.segments.map((s) => s.entryId).join(',') === [annA.id, annB.id, annOverlap.id, annZero.id].join(','));
+  check('2 条跳过（失效 + 批注缺失）', r.skipped.length === 2);
+  check('失效条目的跳过原因被保留', r.skipped.some((s) => s.entryId === annDead.id && /指纹/.test(s.reason)));
+  check('批注缺失有明确原因并保留 entryId',
+    r.skipped.some((s) => s.entryId === 'missing-id' && /不存在/.test(s.reason)));
+  check('跳过项附批注原文（集中列明时可辨认）', !!r.skipped.find((s) => s.entryId === annDead.id).annotation.text);
+  check('段携带场次引用与原始时刻 / 时长',
+    r.segments[0].fileId === SESSION_A.fileId && r.segments[0].startT === 1000 &&
+    r.segments[0].endT === 3000 && r.segments[0].durationMs === 2000);
+  check('重叠区间各自成段（段 1 与段 3 同场次且重叠，未合并）',
+    r.segments[2].fileId === SESSION_A.fileId && r.segments[2].startT === 1000 && r.segments[2].endT === 2000);
+  check('零长段时长为 0 且仍保留', r.segments[3].durationMs === 0 && r.segments[3].startT === 2000);
+
+  console.log('三、resolvePlaylist 装配器：场次只读拉取与缓存、日志缺失跳过');
+  const fetchCalls = [];
+  const loadSession = async (fileId, runId) => {
+    const key = `${fileId}/${runId}`;
+    fetchCalls.push(key);
+    if (fileId === SESSION_B.fileId) return { ok: false, reason: '场次日志找不到（文件或段落不存在，可能已删除）' };
+    return { ok: true, events: eventsA };
+  };
+  // A 的批注都能重定位；B 日志缺失；annDead 指纹失效
+  const rr = await P.resolvePlaylist(
+    [annA.id, annOverlap.id, annDead.id, annB.id, 'missing-id'],
+    [annA, annB, annOverlap, annDead], loadSession);
+  check('可播放 2 段（annA / annOverlap），顺序不变',
+    rr.segments.length === 2 && rr.segments[0].entryId === annA.id && rr.segments[1].entryId === annOverlap.id);
+  check('跳过 3 项：失效 / 日志缺失 / 批注不存在', rr.skipped.length === 3);
+  check('日志缺失原因直达跳过列表', rr.skipped.some((s) => s.entryId === annB.id && /找不到/.test(s.reason)));
+  check('同场次日志只拉一次（缓存）',
+    fetchCalls.filter((k) => k === `${SESSION_A.fileId}/0`).length === 1);
+
+  console.log('四、虚拟时间轴：累计偏移、线性映射、边界进入后一段、跨场次');
+  const segs = P.withOffsets(rr.segments);
+  check('段偏移为首尾累计：0-2000、2000-3000',
+    segs[0].offsetStart === 0 && segs[0].offsetEnd === 2000 &&
+    segs[1].offsetStart === 2000 && segs[1].offsetEnd === 3000);
+  check('总时长为累计区间时长 3000ms', P.totalDuration(segs) === 3000);
+
+  // 段 1 内部映射回 A 场原始时刻
+  let loc = P.locate(segs, 0);
+  check('vt=0 位于第 1 段起点，localT=1000', loc.index === 0 && loc.localT === 1000 && loc.progress === 0);
+  loc = P.locate(segs, 1500);
+  check('vt=1500 位于第 1 段内，localT=1000+(1500-0)=2500', loc.index === 0 && loc.localT === 2500);
+  // 恰好落在边界：进入后一段
+  loc = P.locate(segs, 2000);
+  check('vt 恰好落在边界 2000：进入后一段（第 2 段）', loc.index === 1 && loc.localT === 1000);
+  check('后一段起点 progress=0', loc.progress === 0);
+  // 拖动超出末端 clamp
+  loc = P.locate(segs, 999999);
+  check('拖动超出末端：clamp 到总时长，停在最后一段末尾', loc.index === 1 && loc.localT === 2000 && loc.atEnd);
+  loc = P.locate(segs, -50);
+  check('负向拖动：clamp 回 0', loc.index === 0 && loc.localT === 1000);
+
+  // 跨场次段映射：段 2 改属 B 场（直接构造段数据验证）
+  const cross = P.withOffsets([
+    { entryId: 'x1', fileId: SESSION_A.fileId, runId: 0, startIndex: 1, endIndex: 3, startT: 1000, endT: 3000, durationMs: 2000 },
+    { entryId: 'x2', fileId: SESSION_B.fileId, runId: 2, startIndex: 2, endIndex: 4, startT: 2000, endT: 5000, durationMs: 3000 },
+  ]);
+  check('跨场次累计总时长 5000', P.totalDuration(cross) === 5000);
+  loc = P.locate(cross, 3500);
+  check('vt=3500 进入 B 场段并映射原始时刻 2000+(3500-2000)=3500',
+    loc.index === 1 && loc.seg.fileId === SESSION_B.fileId && loc.localT === 3500);
+  loc = P.locate(cross, 2000);
+  check('跨场次边界 vt=2000 进入 B 场段起点（后一段）', loc.index === 1 && loc.localT === 2000);
+  check('1×/2×/4× 只改变推进速率，不改变映射：同一 vt 结果与速度无关',
+    P.locate(cross, 4000).localT === P.locate(cross, 4000).localT);
+
+  // 零长段：自然映射不可见，forceIndex 精确呈现；边界规则不被零长段截断
+  const withZero = P.withOffsets([
+    { entryId: 'p', fileId: SESSION_A.fileId, runId: 0, startIndex: 1, endIndex: 3, startT: 1000, endT: 3000, durationMs: 2000 },
+    { entryId: 'z', fileId: SESSION_A.fileId, runId: 0, startIndex: 2, endIndex: 2, startT: 2000, endT: 2000, durationMs: 0 },
+    { entryId: 'q', fileId: SESSION_A.fileId, runId: 0, startIndex: 3, endIndex: 4, startT: 3000, endT: 5000, durationMs: 2000 },
+  ]);
+  check('零长段不改变累计时长（总 4000）', P.totalDuration(withZero) === 4000);
+  loc = P.locate(withZero, 2000);
+  check('vt=2000 跳过中间零长段进入第 3 段（边界进后一段）', loc.index === 2 && loc.localT === 3000);
+  loc = P.locate(withZero, 2000, 1);
+  check('forceIndex 可精确呈现零长段，localT=2000', loc.index === 1 && loc.localT === 2000 && loc.progress === 1);
+  check('segmentStartVt 返回零长段所在虚拟位置', P.segmentStartVt(withZero, 1) === 2000);
+  check('locate 空段数组返回 null', P.locate([], 0) === null);
+  check('locateIndex 越界 forceIndex 被忽略，回退常规定位', P.locateIndex(segs, 0, 99) === 0);
+
+  // nudge：键盘跳转在虚拟轴上 clamp 并解除强制段
+  const n = P.nudge(cross, 4500, 1000);
+  check('nudge 超出末端 clamp', n.vt === 5000 && n.releaseForce === true);
+
+  console.log('五、段内事件行边界：cutoffIndex / eventVt（时间 + 日志行序共同回放）');
+  // 同一毫秒挤着 确认 → 撤回 → 重发 → 新轮确认：段锚点切在事件簇中间时，
+  // 仅按毫秒折叠会提前显示或执行区间外事件，必须按行号截断
+  const Core = require('../public/replay-core');
+  const cluster = [
+    ev('2026-09-19T10:00:00.000Z', 0, 'session-start', {}),
+    ev('2026-09-19T10:00:01.000Z', 1000, 'cue-started', { seq: 1, text: '甲', targets: ['灯光', '音响'], attemptId: 'a1' }),
+    ev('2026-09-19T10:00:02.000Z', 2000, 'confirm', { seq: 1, position: '灯光', attemptId: 'a1' }),          // idx 2
+    ev('2026-09-19T10:00:02.000Z', 2000, 'cue-recalled', { seq: 1, oldAttemptId: 'a1', reason: '改词' }),    // idx 3
+    ev('2026-09-19T10:00:02.000Z', 2000, 'cue-resent', { seq: 1, text: '甲二', revision: 2, attemptId: 'a2' }), // idx 4
+    ev('2026-09-19T10:00:02.000Z', 2000, 'confirm', { seq: 1, position: '音响', attemptId: 'a2' }),          // idx 5
+    ev('2026-09-19T10:00:03.000Z', 3000, 'cue-completed', { seq: 1, attemptId: 'a2' }),                      // idx 6
+    ev('2026-09-19T10:00:05.000Z', 5000, 'sequence-finished', {}),                                           // idx 7
+  ];
+  // 段锚定 idx 2..4（confirm 灯光 → cue-resent），区间 [2000, 2000] 零时长
+  const segZero = { entryId: 'z', fileId: 'f', runId: 0, startIndex: 2, endIndex: 4, startT: 2000, endT: 2000, durationMs: 0, offsetStart: 0, offsetEnd: 0 };
+  check('段起点只呈现截至起点锚点：cutoff(localT=startT) = startIndex',
+    P.cutoffIndex(segZero, cluster, 2000) === 2);
+  check('段起点现场不含同毫秒锚点后事件（撤回未生效、仍第 1 版）', (() => {
+    const s = Core.foldUntilIndex(cluster, P.cutoffIndex(segZero, cluster, 2000));
+    return s.revision === 1 && !!s.confirmations['灯光'] && s.attempts.length === 0;
+  })());
+  check('对比：毫秒折叠 foldUntil(2000) 会把同毫秒撤回 / 重发全部折入（revision=2）',
+    Core.foldUntil(cluster, 2000).revision === 2);
+  check('段末不越过终点锚点：localT 再大 cutoff 也不超过 endIndex',
+    P.cutoffIndex(segZero, cluster, 99999) === 4 && P.cutoffIndex(segZero, cluster, 2000.5) === 4);
+  check('段末现场不含同毫秒区间外事件（idx5 的新轮确认不进本段）', (() => {
+    const s = Core.foldUntilIndex(cluster, P.cutoffIndex(segZero, cluster, 99999));
+    return s.revision === 2 && !s.confirmations['音响'];
+  })());
+  check('localT 早于段起点（防御）同样回到起点锚点',
+    P.cutoffIndex(segZero, cluster, 1500) === 2 && P.cutoffIndex(segZero, cluster, NaN) === 2);
+  check('pinnedIndex 精确定位同毫秒具体事件（pin idx3：撤回已封存、重发未生效）', (() => {
+    const cut = P.cutoffIndex(segZero, cluster, 2000, 3);
+    const s = Core.foldUntilIndex(cluster, cut);
+    return cut === 3 && s.attempts.length === 1 && s.attempts[0].endState === 'recalled' && s.revision === 1;
+  })());
+  check('pinnedIndex 越界钳制到锚定行范围（pin idx5→4，pin idx0→2）',
+    P.cutoffIndex(segZero, cluster, 2000, 5) === 4 && P.cutoffIndex(segZero, cluster, 2000, 0) === 2);
+  check('pinnedIndex 非整数被忽略，回退时间换算',
+    P.cutoffIndex(segZero, cluster, 2000, 2.5) === 2 && P.cutoffIndex(segZero, cluster, 2000, null) === 2);
+  check('空事件数组防御：cutoff 为 0 且不抛异常',
+    P.cutoffIndex(segZero, [], 2000) === 0 && P.cutoffIndex(segZero, null, 2000) === 0);
+
+  // 正长段：段内 localT 越过起点后，同毫秒的段内事件按行序纳入，段外不越界
+  const segSpan = { entryId: 's', fileId: 'f', runId: 0, startIndex: 3, endIndex: 6, startT: 2000, endT: 3000, durationMs: 1000, offsetStart: 0, offsetEnd: 1000 };
+  check('正长段起点同样只到起点锚点（idx3，不含同毫秒 idx4/5）',
+    P.cutoffIndex(segSpan, cluster, 2000) === 3);
+  check('正长段内 localT 越过起点：同毫秒段内事件纳入（idx5），但不越过终点锚点',
+    P.cutoffIndex(segSpan, cluster, 2000.5) === 5);
+  check('正长段末 localT=endT：截至终点锚点 idx6，不含同毫秒之后的事件',
+    P.cutoffIndex(segSpan, cluster, 3000) === 6);
+
+  // eventVt：段内事件映射回虚拟时间轴位置（与 locate 线性映射互逆）
+  check('eventVt = offsetStart + (t − startT)',
+    P.eventVt(segSpan, cluster, 6) === 1000 && P.eventVt(segSpan, cluster, 3) === 0);
+  check('同毫秒事件共享同一虚拟位置（具体定位交给 pinnedIndex）',
+    P.eventVt(segSpan, cluster, 4) === P.eventVt(segSpan, cluster, 3));
+  check('eventVt 对缺失事件回退段起点，不抛异常',
+    P.eventVt(segSpan, cluster, 99) === 0 && P.eventVt(segSpan, null, 0) === 0);
+
+  console.log('六、清单读写事务：同一读写事务读当前清单并提交，多标签页并发不丢项');
+  // 两条独立的模块实例（各自开关自己的 IndexedDB 连接），等价于两个标签页
+  const P2 = loadBrowserModule('playlist.js', 'CuePlaylist');
+  await new Promise((resolve) => {
+    const q = indexedDB.deleteDatabase(P.DB_NAME);
+    q.onsuccess = resolve; q.onerror = resolve; q.onblocked = resolve;
+  });
+  const idsOf = (doc) => doc.entries.map((e) => e.id);
+
+  let empty = await P.get();
+  check('空库读取得到单例空文档', empty.id === 'main' && Array.isArray(empty.entries) && empty.entries.length === 0);
+
+  // 基础往返
+  const d0 = await P.addIds(['ann-a', 'ann-b']);
+  check('addIds 返回实际提交的清单（含 addedAt）',
+    idsOf(d0).join(',') === 'ann-a,ann-b' && d0.entries.every((e) => typeof e.addedAt === 'string'));
+  const d0b = await P.get();
+  check('重新读取与提交一致', idsOf(d0b).join(',') === 'ann-a,ann-b');
+
+  // 核心：两页并发勾选不同批注，必须在同一读写事务内读到对方已提交的清单
+  const [c1, c2] = await Promise.all([P.addIds(['ann-c']), P2.addIds(['ann-d'])]);
+  check('并发加入各自提交结果含本人新增 id', idsOf(c1).includes('ann-c') && idsOf(c2).includes('ann-d'));
+  const afterConcurrentAdd = idsOf(await P.get());
+  check('并发加入不同批注后两项都保留（不丢项）',
+    afterConcurrentAdd.includes('ann-c') && afterConcurrentAdd.includes('ann-d') && afterConcurrentAdd.length === 4);
+
+  // 重复加入仍只出现一次（同页幂等 + 两页并发加入同一条）
+  const dup = await P.addIds(['ann-a', 'ann-a', 'ann-c', 'ann-d']);
+  check('同页重复加入去重，保持原顺序', idsOf(dup).join(',') === 'ann-a,ann-b,ann-c,ann-d');
+  await Promise.all([P.addIds(['ann-e']), P2.addIds(['ann-e'])]);
+  const afterDup = idsOf(await P.get());
+  check('两页并发加入同一批注，最终仍只出现一次',
+    afterDup.filter((x) => x === 'ann-e').length === 1 && afterDup.length === 5);
+
+  // 并发移除与加入互不覆盖
+  await Promise.all([P.removeId('ann-a'), P2.addIds(['ann-f'])]);
+  const afterRmAdd = new Set(idsOf(await P.get()));
+  check('并发移除 + 加入：被移除项消失、新增项保留，其余不动',
+    !afterRmAdd.has('ann-a') && afterRmAdd.has('ann-f') && afterRmAdd.has('ann-b') && afterRmAdd.size === 5);
+
+  // mutate：同一事务读-改-写，返回实际提交清单
+  const mutated = await P.mutate((doc) => doc.entries.filter((e) => e.id !== 'ann-b'));
+  check('mutate 在事务内基于最新清单修改并返回提交结果',
+    !idsOf(mutated).includes('ann-b') && idsOf(await P.get()).join(',') === idsOf(mutated).join(','));
+
+  // 排序：仅重排提交时仍在清单中的条目；幽灵 id 忽略，不偷偷新增，也不丢项
+  const beforeReorderDoc = await P.get();
+  const addedAtBefore = new Map(beforeReorderDoc.entries.map((e) => [e.id, e.addedAt]));
+  const reordered = await P.reorder(['ghost-x', 'ann-f', 'ann-d', 'ann-c', 'ann-e']);
+  check('排序忽略已不存在的 id，不新增条目',
+    idsOf(reordered).join(',') === 'ann-f,ann-d,ann-c,ann-e');
+  check('排序只动顺序：各条目 addedAt 原样保留（不重建条目）',
+    reordered.entries.every((e) => addedAtBefore.get(e.id) === e.addedAt));
+
+  // 并发排序 + 另一页加入：新条目不丢（防御性追加到末尾），原有条目按提交清单重排
+  await Promise.all([P.reorder(['ann-e', 'ann-c', 'ann-d', 'ann-f']), P2.addIds(['ann-g'])]);
+  const afterReorderAdd = idsOf(await P.get());
+  check('并发排序期间另一页加入的新条目不丢',
+    afterReorderAdd.includes('ann-g') &&
+    afterReorderAdd.filter((x) => x !== 'ann-g').join(',') === 'ann-e,ann-c,ann-d,ann-f');
+
+  // 并发排序 + 另一页移除：排序只重排提交时仍在清单中的条目
+  await Promise.all([P.reorder(['ann-c', 'ann-g', 'ann-d', 'ann-e', 'ann-f']), P2.removeId('ann-d')]);
+  const afterReorderRm = idsOf(await P.get());
+  check('并发排序引用的条目被另一页移除：最终不含被移除项，其余保留',
+    !afterReorderRm.includes('ann-d') &&
+    new Set(afterReorderRm).size === afterReorderRm.length &&
+    ['ann-c', 'ann-e', 'ann-f', 'ann-g'].every((x) => afterReorderRm.includes(x)));
+
+  // mutator 抛错：事务中止，清单保持不变
+  const beforeThrow = idsOf(await P.get()).join(',');
+  let threw = false;
+  try {
+    await P.commit(() => { throw new Error('boom'); });
+  } catch { threw = true; }
+  check('mutator 抛错时事务中止并向上报错', threw);
+  check('抛错未产生部分写入，清单保持不变', idsOf(await P.get()).join(',') === beforeThrow);
+
+  // 清空：单事务删除并返回空文档
+  const cleared = await P.clear();
+  check('clear 后为空文档且库内确为空', cleared.entries.length === 0 && (await P2.get()).entries.length === 0);
+
+  console.log('七、页面只读性（HTTP GET 静态页，无 WebSocket、无写接口）');
+  const pageResp = await getPage('/playlist.html');
+  const page = pageResp.body;
+  check('播放页可访问', pageResp.status === 200);
+  check('页面不创建 WebSocket', !/new\s+WebSocket/.test(page));
+  check('页面不出现任何写接口调用', !/fetch\(\s*['"`][^'"`]*(POST|PUT|DELETE)/i.test(page));
+  check('页面只引用复盘只读 GET 接口',
+    page.includes('/api/replay/sessions') && !/\/api\/(?!replay)/.test(page.replace(/\/api\/replay\/sessions/g, '')));
+  check('页面引用清单模块与 IndexedDB 库名 cue-playlists',
+    page.includes('playlist.js') &&
+    /cue-playlists/.test(fs.readFileSync(path.join(__dirname, '..', 'public', 'playlist.js'), 'utf8')));
+  check('页面含 1×/2×/4× 倍速与虚拟时间轴',
+    ['data-speed="1"', 'data-speed="2"', 'data-speed="4"'].every((s) => page.includes(s)) && page.includes('pl-timeline'));
+  check('播放页按锚定事件行回放（foldUntilIndex + cutoffIndex + eventVt + 事件锁定）',
+    page.includes('foldUntilIndex') && page.includes('cutoffIndex') &&
+    page.includes('eventVt') && page.includes('seekToEvent'));
+
+  const annResp = await getPage('/annotations.html');
+  const annPage = annResp.body;
+  check('批注簿页可访问且含「复盘播放清单」勾选区与播放页入口',
+    annResp.status === 200 && annPage.includes('playlist.js') &&
+    annPage.includes('复盘播放清单') && annPage.includes('playlist.html'));
+  check('批注簿清单支持拖拽排序（draggable + data-pl-id）',
+    annPage.includes('draggable="true"') && annPage.includes('data-pl-id'));
+
+  const idxResp = await getPage('/');
+  check('首页提供播放清单入口卡片', idxResp.status === 200 && idxResp.body.includes('playlist.html'));
+
+  // 不存在任何清单写接口：服务端 /api/playlists 应 404
+  const noWriteApi = await httpGet('/api/playlists').catch(() => null);
+  check('服务端不存在清单 API（清单不经服务端）', !noWriteApi || noWriteApi.status === 404);
+
+  console.log(`\n结果：${passed} 通过，${failed} 失败`);
+  process.exit(failed ? 1 : 0);
+}
+
+main().catch((err) => { console.error(err); process.exit(1); });
