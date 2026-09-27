@@ -518,6 +518,116 @@ async function main() {
       Core.extractCues([null, {}, { event: 'x' }]).length === 0);
   }
 
+  console.log('十、岗位名与 Object.prototype 继承成员同名（constructor / __proto__ / toString）');
+  {
+    // 与服务端同一口径：这些名称按普通岗位处理，读写只认自有属性；
+    // 快照 / 封存 / JSON 往返均保留原文，复盘按日志重建相同确认与替岗结果
+    const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+    const SPECIAL = ['constructor', '__proto__', 'toString'];
+    const es = [
+      ev(0, 'session-start', {}),
+      ev(0, 'cue-started', { seq: 1, text: '特殊岗位', targets: SPECIAL, attemptId: 's1' }),
+      ev(1000, 'confirm', { seq: 1, position: 'constructor', attemptId: 's1' }),
+      ev(1100, 'confirm-duplicate', { seq: 1, position: 'constructor', attemptId: 's1' }),
+      ev(2000, 'cue-timeout', { seq: 1, attemptId: 's1', missing: ['__proto__', 'toString'] }),
+      ev(3000, 'position-substituted', { seq: 1, from: '__proto__', to: '灯光', attemptId: 's1' }),
+      ev(4000, 'confirm-late', { seq: 1, position: '灯光', attemptId: 's1' }),
+      ev(5000, 'confirm-late', { seq: 1, position: 'toString', attemptId: 's1' }),
+      ev(6000, 'cue-completed', { seq: 1, attemptId: 's1' }),
+      ev(7000, 'cue-started', { seq: 2, text: '第二条', targets: ['constructor'], attemptId: 's2' }),
+      ev(8000, 'confirm', { seq: 2, position: 'constructor', attemptId: 's2' }),
+      ev(8100, 'cue-recalled', { seq: 2, oldAttemptId: 's2', reason: '修正', newText: '第二条v2' }),
+      ev(8200, 'cue-resent', { seq: 2, text: '第二条v2', revision: 2, attemptId: 's3', reason: '修正' }),
+      ev(9000, 'confirm', { seq: 2, position: 'constructor', attemptId: 's3' }),
+      ev(10000, 'cue-completed', { seq: 2, revision: 2, attemptId: 's3' }),
+      ev(11000, 'sequence-finished', {}),
+    ];
+
+    const before = Core.foldUntil(es, 500);
+    check('未确认前特殊岗位不被误判已确认（viewOf 全部 pending）',
+      Core.viewOf(before).confirmed.length === 0 &&
+      JSON.stringify(Core.viewOf(before).pending) === JSON.stringify(SPECIAL));
+    check('未确认前有效目标保留原文（无空值、无继承污染）',
+      JSON.stringify(Core.viewOf(before).effective) === JSON.stringify(SPECIAL) &&
+      Object.keys(before.confirmations).length === 0);
+
+    const atCtor = Core.foldUntil(es, 1000);
+    check('constructor 确认计入（自有键），__proto__/toString 仍待确认',
+      hasOwn(atCtor.confirmations, 'constructor') &&
+      !hasOwn(atCtor.confirmations, '__proto__') && !hasOwn(atCtor.confirmations, 'toString') &&
+      JSON.stringify(Core.viewOf(atCtor).pending) === JSON.stringify(['__proto__', 'toString']));
+    check('constructor 重复确认只作刻度（duplicateEvents 记录一次）',
+      Core.foldEvents(es).cuesBySeq.get(1).rounds[0]
+        .confirms.find((c) => c.position === 'constructor').duplicateEvents.length === 1);
+
+    const atTimeout = Core.foldUntil(es, 2000);
+    check('特殊岗位超时标记按原文记录',
+      JSON.stringify(atTimeout.timedOut) === JSON.stringify(['__proto__', 'toString']));
+
+    const atSub = Core.foldUntil(es, 3000);
+    check('__proto__ 替岗记录为自有键（__proto__→灯光）',
+      hasOwn(atSub.substitutions, '__proto__') &&
+      atSub.substitutions['__proto__'].substitute === '灯光');
+    check('替岗后有效目标：__proto__ 被灯光顶替，其余原文保留',
+      JSON.stringify(Core.viewOf(atSub).effective) ===
+        JSON.stringify(['constructor', '灯光', 'toString']));
+    check('超时标记随确认权移交（__proto__→灯光）',
+      JSON.stringify(atSub.timedOut) === JSON.stringify(['灯光', 'toString']));
+    check('替岗表经 JSON 往返仍保留 __proto__ 自有键',
+      hasOwn(JSON.parse(JSON.stringify(atSub)).substitutions, '__proto__'));
+
+    const atLate = Core.foldUntil(es, 4000);
+    check('替补灯光迟到确认计入、移出超时表',
+      hasOwn(atLate.confirmations, '灯光') && atLate.confirmations['灯光'].late === true &&
+      JSON.stringify(atLate.timedOut) === JSON.stringify(['toString']));
+    const atAll = Core.foldUntil(es, 5000);
+    check('toString 迟到确认后全员到齐（confirmed 含三个特殊名相关岗位）',
+      JSON.stringify(Core.viewOf(atAll).confirmed.map((c) => c.position).sort()) ===
+        JSON.stringify(['constructor', 'toString', '灯光'].sort()) &&
+      atAll.timedOut.length === 0);
+
+    const atDone1 = Core.foldUntil(es, 6000);
+    check('完成封存：确认表含 constructor/灯光/toString 自有键',
+      atDone1.attempts.length === 1 && atDone1.attempts[0].endState === 'completed' &&
+      ['constructor', '灯光', 'toString'].every((p) => hasOwn(atDone1.attempts[0].confirmations, p)));
+    check('完成封存：替岗表保留 __proto__ 自有键',
+      hasOwn(atDone1.attempts[0].substitutions, '__proto__') &&
+      atDone1.attempts[0].substitutions['__proto__'].substitute === '灯光');
+    check('封存快照 JSON 序列化保留 __proto__ 原文',
+      JSON.stringify(atDone1.attempts[0]).includes('"__proto__"'));
+
+    const atCue2 = Core.foldUntil(es, 7000);
+    check('推进后新口令不残留旧确认/替岗/超时',
+      Object.keys(atCue2.confirmations).length === 0 &&
+      Object.keys(atCue2.substitutions).length === 0 && atCue2.timedOut.length === 0 &&
+      JSON.stringify(Core.viewOf(atCue2).pending) === JSON.stringify(['constructor']));
+
+    const atRecall = Core.foldUntil(es, 8200);
+    check('撤回后新轮清空（无确认残留）、修订号为 2',
+      atRecall.revision === 2 && Object.keys(atRecall.confirmations).length === 0);
+    check('撤回封存保留 constructor 旧轮确认（自有键）',
+      atRecall.attempts.length === 1 && atRecall.attempts[0].endState === 'recalled' &&
+      hasOwn(atRecall.attempts[0].confirmations, 'constructor'));
+
+    const fin = Core.foldUntil(es, 11000);
+    check('全场结束：phase=done 且现场表清空',
+      fin.phase === 'done' && Object.keys(fin.confirmations).length === 0 &&
+      Object.keys(fin.substitutions).length === 0);
+
+    const rich = Core.foldEvents(es);
+    check('富模型：口令1 确认表 / 替岗表均为自有键',
+      hasOwn(rich.cuesBySeq.get(1).rounds[0].confirmsMap, 'constructor') &&
+      hasOwn(rich.cuesBySeq.get(1).rounds[0].substitutionsMap, '__proto__'));
+    check('富模型：口令2 两个轮次（撤回 + 修订），新轮 constructor 确认',
+      rich.cuesBySeq.get(2).rounds.length === 2 &&
+      hasOwn(rich.cuesBySeq.get(2).rounds[1].confirmsMap, 'constructor'));
+    check('extractCues 目标岗位保留原文',
+      JSON.stringify(Core.extractCues(es)[0].targets) === JSON.stringify(SPECIAL));
+    check('浏览器 <script> 形态与 Node 实体对特殊岗位名折叠一致',
+      JSON.stringify(BrowserCore.foldUntil(es, 5000)) === JSON.stringify(Core.foldUntil(es, 5000)) &&
+      JSON.stringify(BrowserCore.foldUntil(es, 11000)) === JSON.stringify(fin));
+  }
+
   console.log(`\n结果：${passed} 通过，${failed} 失败`);
   process.exit(failed ? 1 : 0);
 }

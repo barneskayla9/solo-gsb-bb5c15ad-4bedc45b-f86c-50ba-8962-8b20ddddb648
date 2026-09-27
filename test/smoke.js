@@ -10,6 +10,10 @@ function check(name, cond) {
   else { failed++; console.log(`  ✘ ${name}`); }
 }
 
+// 自有属性判定：constructor / __proto__ / toString 等与 Object.prototype 成员
+// 同名的岗位名，确认 / 替岗记录只应出现在自有属性上
+const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+
 function client(role, position, cid) {
   const ws = new WebSocket(URL);
   const c = {
@@ -718,6 +722,131 @@ function stopHeartbeat(c) {
   dirY.send({ type: 'saveDraft', revision: 1, cues: [{ text: 'Y 刷新后覆盖', targets: ['音响'] }] });
   st = await dirY.waitState((s) => s.draft && s.draft.revision === 2);
   check('后来者刷新后重做成功', st.draft.cues[0].text === 'Y 刷新后覆盖');
+
+  // ===========================================================================
+  // 岗位名与 Object.prototype 继承成员同名（constructor / __proto__ / toString）
+  // 这些名称必须按普通岗位处理：确认 / 替岗读写只认自有属性，原文经快照、
+  // 日志封存与复盘重建完整保留；替岗只移交指定岗位，撤回 / 推进不残留旧记录。
+  // ===========================================================================
+  console.log('51. 特殊岗位名（constructor / __proto__ / toString）按普通岗位处理');
+  const SPECIAL = ['constructor', '__proto__', 'toString'];
+  // 放弃第 50 步遗留的下一场草稿并重置到 idle
+  control2.send({ type: 'reset', resetMode: 'keep' });
+  await control2.waitState((s) => s.phase === 'idle' && s.draft === null);
+  const spCtor = client('position', 'constructor');
+  const spProto = client('position', '__proto__');
+  const spToStr = client('position', 'toString');
+  await Promise.all([spCtor.ready, spProto.ready, spToStr.ready]);
+  await sleep(200);
+  director.send({ type: 'setSequence', timeoutSec: 5, cues: [
+    { text: '特殊岗位口令一', targets: SPECIAL },
+    { text: '特殊岗位口令二（替岗）', targets: ['__proto__', '灯光'] },
+    { text: '特殊岗位口令三（撤回）', targets: ['constructor', 'toString'] },
+  ]});
+  st = await control2.waitState((s) => s.sequence.length === 3);
+
+  control2.send({ type: 'start' });
+  st = await control2.waitState((s) => s.phase === 'active' && s.currentCue && s.currentCue.seq === 1);
+  check('特殊岗位名有效目标保留原文（无空值）',
+    JSON.stringify(st.effectiveTargets) === JSON.stringify(SPECIAL));
+  check('未确认前特殊岗位不显示已确认（无自有确认记录）',
+    !hasOwn(st.confirmations, 'constructor') && !hasOwn(st.confirmations, '__proto__') &&
+    !hasOwn(st.confirmations, 'toString'));
+  control2.errors = [];
+  control2.send({ type: 'advance' });
+  await sleep(300);
+  check('特殊岗位未全员确认前推进被服务端拒绝',
+    control2.errors.some((e) => e.includes('尚未确认')) && control2.state.currentCue.seq === 1);
+  light2.errors = [];
+  light2.send({ type: 'confirm', attemptId: st.attemptId });
+  await sleep(200);
+  check('非目标岗位（灯光）确认被拒', light2.errors.some((e) => e.includes('不涉及岗位')));
+
+  confirmCue(spCtor);
+  confirmCue(spProto);
+  confirmCue(spToStr);
+  st = await control2.waitState((s) =>
+    hasOwn(s.confirmations, 'constructor') && hasOwn(s.confirmations, '__proto__') &&
+    hasOwn(s.confirmations, 'toString'));
+  check('三个特殊岗位确认均接受且无报错',
+    !spCtor.errors.length && !spProto.errors.length && !spToStr.errors.length);
+  check('确认表经 JSON 快照完整（__proto__ 为自有键）',
+    Object.keys(st.confirmations).sort().join(',') ===
+      ['__proto__', 'constructor', 'toString'].sort().join(','));
+  check('确认表 JSON 序列化保留 __proto__ 原文',
+    JSON.stringify(st.confirmations).includes('"__proto__"'));
+  confirmCue(spCtor);
+  await sleep(300);
+  check('特殊岗位重复确认被实时标记（constructor）',
+    control2.state.log.some((l) => l.event === 'confirm-duplicate' && l.detail.position === 'constructor'));
+
+  control2.send({ type: 'advance' });
+  st = await control2.waitState((s) => s.currentCue && s.currentCue.seq === 2);
+  const spArch1 = st.cueHistory[st.sequence[0].id].attempts[0];
+  check('第一条封存轮次确认记录完整（含 __proto__ 自有键）',
+    spArch1.endState === 'completed' &&
+    Object.keys(spArch1.confirmations).sort().join(',') ===
+      ['__proto__', 'constructor', 'toString'].sort().join(','));
+  check('推进后新轮次不残留上一条的替岗/超时',
+    Object.keys(st.substitutions).length === 0 && st.timedOut.length === 0);
+
+  check('第二条有效目标为 __proto__、灯光（原文保留）',
+    JSON.stringify(st.effectiveTargets) === JSON.stringify(['__proto__', '灯光']));
+  control2.errors = [];
+  control2.send({ type: 'substitute', from: '__proto__', to: 'toString', attemptId: st.attemptId });
+  st = await control2.waitState((s) => hasOwn(s.substitutions, '__proto__'));
+  check('__proto__ 替岗成功且记录为自有键（无报错）',
+    !control2.errors.length && st.substitutions['__proto__'].substitute === 'toString');
+  check('替岗表 JSON 序列化保留 __proto__ 原文',
+    JSON.stringify(st.substitutions).includes('"__proto__"'));
+  check('替岗后有效目标变为 toString、灯光',
+    JSON.stringify(st.effectiveTargets) === JSON.stringify(['toString', '灯光']));
+  spProto.errors = [];
+  spProto.send({ type: 'confirm', attemptId: st.attemptId });
+  await sleep(200);
+  check('被替岗的原岗位 __proto__ 再确认被拒（已移交）',
+    spProto.errors.some((e) => e.includes('已移交')));
+  confirmCue(spToStr);
+  confirmCue(light2);
+  st = await control2.waitState((s) =>
+    hasOwn(s.confirmations, 'toString') && hasOwn(s.confirmations, '灯光'));
+  check('替补 toString 与灯光确认计入全员，原岗位 __proto__ 无确认记录',
+    !hasOwn(st.confirmations, '__proto__'));
+  control2.send({ type: 'advance' });
+  st = await control2.waitState((s) => s.currentCue && s.currentCue.seq === 3);
+  check('再推进后替岗关系不残留到新口令',
+    Object.keys(st.substitutions).length === 0 &&
+    JSON.stringify(st.effectiveTargets) === JSON.stringify(['constructor', 'toString']) &&
+    Object.keys(st.confirmations).length === 0);
+
+  // 第三条：constructor 先确认（toString 未确认），再撤回修订重发；新轮清空、旧轮封存完整
+  const spRound1Attempt = st.attemptId;
+  confirmCue(spCtor);
+  await control2.waitState((s) => hasOwn(s.confirmations, 'constructor'));
+  control2.send({ type: 'recall', reason: '特殊岗位撤回验证', text: '修正版特殊岗位口令三' });
+  st = await control2.waitState((s) => s.revision === 2);
+  check('撤回后新轮次确认/替岗/超时全部清空',
+    Object.keys(st.confirmations).length === 0 && Object.keys(st.substitutions).length === 0 &&
+    st.timedOut.length === 0 && st.currentCue.text === '修正版特殊岗位口令三');
+  const spArch3old = st.cueHistory[st.currentCue.id].attempts[0];
+  check('撤回封存保留 constructor 的旧轮确认',
+    spArch3old.endState === 'recalled' && hasOwn(spArch3old.confirmations, 'constructor'));
+  spCtor.errors = [];
+  spCtor.send({ type: 'confirm', attemptId: spRound1Attempt });
+  await sleep(200);
+  check('constructor 的旧轮次确认被拒（stale-confirm）',
+    spCtor.errors.some((e) => e.includes('旧轮次')));
+  confirmCue(spCtor);
+  confirmCue(spToStr);
+  await control2.waitState((s) => hasOwn(s.confirmations, 'constructor') && hasOwn(s.confirmations, 'toString'));
+  control2.send({ type: 'advance' });
+  st = await control2.waitState((s) => s.phase === 'done');
+  check('合法确认（含修订轮）后全场完成', st.phase === 'done');
+  control2.send({ type: 'reset', resetMode: 'normal' });
+  st = await control2.waitState((s) => s.phase === 'idle');
+  check('重置后确认 / 替岗 / 超时表全部清空',
+    Object.keys(st.confirmations).length === 0 && Object.keys(st.substitutions).length === 0 &&
+    st.timedOut.length === 0 && st.effectiveTargets.length === 0);
 
   console.log(`\n结果：${passed} 通过，${failed} 失败`);
   process.exit(failed ? 1 : 0);

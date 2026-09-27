@@ -123,12 +123,23 @@ const CueClient = (() => {
     }).join('');
   }
 
+  // 岗位名做对象键的安全读取：constructor / toString / __proto__ 等与
+  // Object.prototype 继承成员同名的岗位，必须只认自有属性——否则未确认时
+  // 会把继承来的函数 / 原型误判为「已确认 / 已替岗」。快照经 JSON.parse 得到，
+  // 这些名称在快照中是自有属性，原样保留。
+  function getOwn(rec, key) {
+    return rec != null && Object.prototype.hasOwnProperty.call(rec, key) ? rec[key] : undefined;
+  }
+
   // 渲染某条口令已封存的只读历史轮次（撤回/推进封存，新轮次不可再修改）
   function renderAttempts(hist, cue) {
     if (!hist || !Array.isArray(hist.attempts) || hist.attempts.length === 0) return '';
     return hist.attempts.slice().reverse().map((a) => {
       const subs = a.substitutions || {};
-      const effective = (cue.targets || []).map((t) => (subs[t] ? subs[t].substitute : t));
+      const effective = (cue.targets || []).map((t) => {
+        const sub = getOwn(subs, t);
+        return sub ? sub.substitute : t;
+      });
       const confs = a.confirmations || {};
       const confirmed = Object.keys(confs);
       const timedOut = a.timedOut || [];
@@ -178,5 +189,5 @@ const CueClient = (() => {
       `<span class="vchip vchip-pub">🔒 已发布序列版本：v${pub}</span>${draftChip}</div>`;
   }
 
-  return { connect, getClientId, fmtTime, renderLog, renderAttempts, renderVersionBar, escapeHtml };
+  return { connect, getClientId, fmtTime, renderLog, renderAttempts, renderVersionBar, escapeHtml, getOwn };
 })();

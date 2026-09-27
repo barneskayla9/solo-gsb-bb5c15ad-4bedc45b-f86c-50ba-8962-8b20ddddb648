@@ -35,6 +35,23 @@ const ReplayCore = (() => {
     return Number.isFinite(n) ? n : fallback;
   }
 
+  // 岗位名做对象键的安全读写（与服务端 server.js 同一口径）：
+  // constructor / toString / __proto__ 等与 Object.prototype 继承成员同名的
+  // 岗位名必须与普通岗位一视同仁——读取只认自有属性（否则未确认被误判为
+  // 已确认、有效目标被污染成空值）；写入经 defineProperty 建立自有属性
+  // （对普通对象直接 rec['__proto__'] = x 会改写其原型，记录就此丢失）。
+  // 事件日志与快照中的这些名称经 JSON.parse 后均为自有属性，原样保留。
+  const POS_HAS = Object.prototype.hasOwnProperty;
+  function posGet(rec, key) {
+    return rec != null && POS_HAS.call(rec, key) ? rec[key] : undefined;
+  }
+  function posSet(rec, key, value) {
+    Object.defineProperty(rec, key, {
+      value, writable: true, enumerable: true, configurable: true,
+    });
+    return rec;
+  }
+
   // 折叠内核状态。rounds / cues / orphanStale 等富模型字段与复盘页需要的
   // 现场镜像字段并存：镜像始终由当前轮次（s.currentRound）同步而来，保证
   // 复盘、对比、诊断看到的是同一份模型。
@@ -74,13 +91,13 @@ const ReplayCore = (() => {
 
   function cloneConfirmations(map) {
     const out = {};
-    for (const [k, v] of Object.entries(map || {})) out[k] = { late: !!(v && v.late) };
+    for (const [k, v] of Object.entries(map || {})) posSet(out, k, { late: !!(v && v.late) });
     return out;
   }
 
   function cloneSubstitutions(map) {
     const out = {};
-    for (const [k, v] of Object.entries(map || {})) out[k] = { substitute: v.substitute };
+    for (const [k, v] of Object.entries(map || {})) posSet(out, k, { substitute: v.substitute });
     return out;
   }
 
@@ -259,11 +276,11 @@ const ReplayCore = (() => {
     if (!c) {
       c = { position, late: !!late, t: num(ev.t), line: ev.line, duplicateEvents: [] };
       round.confirms.push(c);
-      round.confirmsMap[position] = { late: !!late };
+      posSet(round.confirmsMap, position, { late: !!late });
     }
     if (late) {
       c.late = true;
-      round.confirmsMap[position] = { late: true };
+      posSet(round.confirmsMap, position, { late: true });
       round.timedOut = round.timedOut.filter((x) => x !== position);
       if (round.cue) round.cue.lateConfirms += 1;
     }
@@ -429,7 +446,7 @@ const ReplayCore = (() => {
           if (!c) {
             c = { position, late: false, t: num(ev.t), line: ev.line, duplicateEvents: [] };
             r.confirms.push(c);
-            if (!r.confirmsMap[position]) r.confirmsMap[position] = { late: false };
+            if (!posGet(r.confirmsMap, position)) posSet(r.confirmsMap, position, { late: false });
           }
           c.duplicateEvents.push({ t: num(ev.t), line: ev.line });
         }
@@ -454,8 +471,8 @@ const ReplayCore = (() => {
         const r = roundOf(s, d) || s.currentRound;
         const from = String(d.from || '');
         const to = String(d.to || '');
-        if (r && from && to && !r.substitutionsMap[from]) {
-          r.substitutionsMap[from] = { substitute: to };
+        if (r && from && to && !posGet(r.substitutionsMap, from)) {
+          posSet(r.substitutionsMap, from, { substitute: to });
           r.substitutions.push({ from, to, t: num(ev.t), line: ev.line });
           // 超时未确认标记随确认权一并移交给替补
           r.timedOut = r.timedOut.map((x) => (x === from ? to : x));
@@ -654,7 +671,10 @@ const ReplayCore = (() => {
   function effectiveTargets(s) {
     const targets = s.currentRound ? s.currentRound.cue.targets : s.targets;
     const subs = s.currentRound ? s.currentRound.substitutionsMap : s.substitutions;
-    return targets.map((t) => (subs[t] ? subs[t].substitute : t));
+    return targets.map((t) => {
+      const sub = posGet(subs, t);
+      return sub ? sub.substitute : t;
+    });
   }
 
   // 折叠状态 → 可渲染视图（岗位状态分组）；筛选与展示属于消费者职责
@@ -664,7 +684,7 @@ const ReplayCore = (() => {
     const timedOut = [];
     const pending = [];
     for (const t of effective) {
-      const c = s.confirmations[t];
+      const c = posGet(s.confirmations, t);
       if (c) confirmed.push({ position: t, late: !!c.late });
       else if (s.timedOut.includes(t)) timedOut.push(t);
       else pending.push(t);

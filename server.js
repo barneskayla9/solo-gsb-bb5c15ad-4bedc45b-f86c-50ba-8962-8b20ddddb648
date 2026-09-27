@@ -21,6 +21,29 @@ const LEASE_SWEEP_MS = Math.min(10000, Math.max(200, Number(process.env.LEASE_SW
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // ---------------------------------------------------------------------------
+// 岗位名做对象键的安全读写
+// ---------------------------------------------------------------------------
+// 岗位名由导演自由编排，可能与 Object.prototype 的继承成员同名
+// （constructor / toString / __proto__ 等）。这类名称必须与普通岗位一视同仁：
+//   - 读取只认自有属性：否则未确认时会把继承来的函数 / 原型误判为「已确认 /
+//     已替岗」，有效目标也会被污染成空值，确认与替岗反被错误拒绝；
+//   - 写入（尤其 __proto__）必须经 defineProperty 建立自有属性——对普通对象
+//     直接做 rec['__proto__'] = x 会改写其原型而非建键，记录就此丢失。
+// JSON.stringify / structuredClone / 客户端 JSON.parse 均按自有属性
+// （CreateDataProperty）处理，故 WebSocket 快照字段形状与日志格式完全不变，
+// 这些岗位名原样保留；历史封存（structuredClone）同样完整。
+const POS_HAS = Object.prototype.hasOwnProperty;
+function posGet(rec, key) {
+  return rec != null && POS_HAS.call(rec, key) ? rec[key] : undefined;
+}
+function posSet(rec, key, value) {
+  Object.defineProperty(rec, key, {
+    value, writable: true, enumerable: true, configurable: true,
+  });
+  return rec;
+}
+
+// ---------------------------------------------------------------------------
 // 会话状态（单场次，内存态；事件日志同时落盘到 data/events-<sessionId>.jsonl）
 // ---------------------------------------------------------------------------
 const state = {
@@ -105,7 +128,7 @@ function snapshotCurrentAttempt(cue, endState, reason) {
 function effectiveTargets(cue) {
   if (!cue) return [];
   return cue.targets.map((t) => {
-    const sub = state.substitutions[t];
+    const sub = posGet(state.substitutions, t);
     return sub ? sub.substitute : t;
   });
 }
@@ -113,7 +136,7 @@ function effectiveTargets(cue) {
 function allConfirmed() {
   const cue = currentCue();
   if (!cue) return false;
-  return effectiveTargets(cue).every((t) => state.confirmations[t]);
+  return effectiveTargets(cue).every((t) => posGet(state.confirmations, t));
 }
 
 // 断线重连恢复依赖全量状态快照：任何变化都广播完整公开状态
@@ -328,7 +351,7 @@ function armCueTimer(cue, revision, delayMs) {
       broadcastState();
       return;
     }
-    const missing = effectiveTargets(cueNow).filter((t) => !state.confirmations[t]);
+    const missing = effectiveTargets(cueNow).filter((t) => !posGet(state.confirmations, t));
     if (missing.length === 0) return;
     // 本轮已标记过超时（如暂停前已超时，恢复后定时器再次到期）：不重复标记、不重复记录
     if (state.timedOut.length > 0) return;
@@ -713,7 +736,7 @@ function handleMessage(ws, msg) {
       if (state.paused) return sendError(ws, '口令已暂停，请先恢复再推进');
       if (!allConfirmed()) {
         const cue = currentCue();
-        const missing = effectiveTargets(cue).filter((t) => !state.confirmations[t]);
+        const missing = effectiveTargets(cue).filter((t) => !posGet(state.confirmations, t));
         return sendError(ws, `以下岗位尚未确认，禁止推进：${missing.join('、')}`);
       }
       const doneCue = currentCue();
@@ -863,24 +886,25 @@ function handleMessage(ws, msg) {
       const position = meta.position;
       if (!effectiveTargets(cue).includes(position)) {
         // 原岗位被替岗后，确认权已移交替补，不得再确认本轮
-        if (cue.targets.includes(position) && state.substitutions[position]) {
-          return sendError(ws, `本岗位的确认任务已移交「${state.substitutions[position].substitute}」，无需再确认`);
+        const mySub = posGet(state.substitutions, position);
+        if (cue.targets.includes(position) && mySub) {
+          return sendError(ws, `本岗位的确认任务已移交「${mySub.substitute}」，无需再确认`);
         }
         return sendError(ws, `本条口令不涉及岗位「${position}」`);
       }
       // 重复确认：实时标记进日志，不改变状态
-      if (state.confirmations[position]) {
+      if (posGet(state.confirmations, position)) {
         addLog('confirm-duplicate', { seq: cue.seq, revision, attemptId: state.attemptId, position });
         broadcastState();
         return;
       }
       const late = state.timedOut.includes(position);
-      state.confirmations[position] = {
+      posSet(state.confirmations, position, {
         clientId: meta.clientId,
         at: Date.now(),
         late,
         attemptId: state.attemptId,
-      };
+      });
       if (late) state.timedOut = state.timedOut.filter((t) => t !== position);
       addLog(late ? 'confirm-late' : 'confirm', {
         seq: cue.seq, revision, attemptId: state.attemptId, position,
@@ -912,10 +936,10 @@ function handleMessage(ws, msg) {
       if (!cue.targets.includes(from)) {
         return sendError(ws, `「${from}」不是本条口令的目标岗位`);
       }
-      if (state.substitutions[from]) {
-        return sendError(ws, `「${from}」的确认任务已被「${state.substitutions[from].substitute}」接管`);
+      if (posGet(state.substitutions, from)) {
+        return sendError(ws, `「${from}」的确认任务已被「${posGet(state.substitutions, from).substitute}」接管`);
       }
-      if (state.confirmations[from]) {
+      if (posGet(state.confirmations, from)) {
         return sendError(ws, `「${from}」已确认，无需替岗`);
       }
       if (!onlinePositions.has(to)) {
@@ -926,7 +950,7 @@ function handleMessage(ws, msg) {
         return sendError(ws, `「${to}」已是本条口令的有效目标，不能作为替补`);
       }
       // 原子更新：仅当前口令的有效目标与确认权限，下一条口令不受影响
-      state.substitutions[from] = { substitute: to, at: Date.now() };
+      posSet(state.substitutions, from, { substitute: to, at: Date.now() });
       // 超时未确认标记随确认权一起移交给替补
       if (state.timedOut.includes(from)) {
         state.timedOut = state.timedOut.map((t) => (t === from ? to : t));
