@@ -184,7 +184,7 @@
     }
 
     function targetChip(state, t, opts = {}) {
-      const conf = state.confirmations[t];
+      const conf = CueClient.own(state.confirmations, t);
       const timedOut = state.timedOut.includes(t);
       const online = state.onlinePositions.includes(t);
       let cls = 'chip', label = CueClient.escapeHtml(t);
@@ -215,7 +215,7 @@
       const subs = state.substitutions || {};
       // 口令推进、暂停、目标已确认、已被替岗或失去指挥权时，自动收起选择面板
       if (substitutingFor && (!active || state.paused || !cue || !cue.targets.includes(substitutingFor) ||
-          subs[substitutingFor] || state.confirmations[substitutingFor] || !iHold(state))) {
+          CueClient.own(subs, substitutingFor) || CueClient.own(state.confirmations, substitutingFor) || !iHold(state))) {
         substitutingFor = null;
       }
       if (!substitutingFor) {
@@ -256,7 +256,7 @@
     function renderPausePanel(state) {
       const active = state.phase === 'active';
       const allDone = active && (state.effectiveTargets || []).length > 0 &&
-        (state.effectiveTargets || []).every((t) => state.confirmations[t]);
+        (state.effectiveTargets || []).every((t) => CueClient.own(state.confirmations, t));
       // 面板模式不变时不重建 DOM，避免广播刷新清空正在填写的暂停原因
       const mode = !active ? 'idle' : !iHold(state) ? 'nolease' : state.paused ? 'paused' : allDone ? 'done' : 'form';
       if (pausePanel.dataset.mode === mode) return;
@@ -299,7 +299,7 @@
     function renderRecallPanel(state) {
       const active = state.phase === 'active';
       const allDone = active && (state.effectiveTargets || []).length > 0 &&
-        (state.effectiveTargets || []).every((t) => state.confirmations[t]);
+        (state.effectiveTargets || []).every((t) => CueClient.own(state.confirmations, t));
       // 面板模式不变时不重建 DOM，避免广播刷新清空正在填写的撤回原因/修正文本
       const mode = !active ? 'idle' : !iHold(state) ? 'nolease' : allDone ? 'done' : 'form';
       if (recallPanel.dataset.mode === mode) return;
@@ -446,13 +446,13 @@
       if (active && cue) {
         const subs = state.substitutions || {};
         targetsEl.innerHTML = cue.targets.map((t) => {
-          const sub = subs[t];
+          const sub = CueClient.own(subs, t);
           if (sub) {
             return targetChip(state, t, { subbedOut: true, subTo: sub.substitute }) +
               targetChip(state, sub.substitute, { isSub: true });
           }
           let html = targetChip(state, t, {});
-          if (!paused && !state.confirmations[t] && mine) {
+          if (!paused && !CueClient.own(state.confirmations, t) && mine) {
             html += `<button class="mini" data-subfrom="${CueClient.escapeHtml(t)}">⇄ 替岗</button>`;
           }
           return html;

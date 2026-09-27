@@ -146,9 +146,10 @@ function stopHeartbeat(c) {
   st = await control.waitState((s) => s.substitutions && s.substitutions['道具']);
   check('替岗已生效（道具 → 灯光）', st.substitutions['道具'].substitute === '灯光');
   check('有效目标更新为 音响+灯光', st.effectiveTargets.includes('灯光') && !st.effectiveTargets.includes('道具'));
-  const subLog = st.log.find((l) => l.event === 'position-substituted');
-  check('替岗写入事件日志（原岗位/替补/时间）',
-    !!subLog && subLog.detail.from === '道具' && subLog.detail.to === '灯光' && !!subLog.ts);
+  // 事件日志跨场次累计（同一服务进程内可能有此前场次的替岗记录），按本条替岗精确匹配
+  const subLog = st.log.find((l) => l.event === 'position-substituted' &&
+    l.detail && l.detail.from === '道具' && l.detail.to === '灯光');
+  check('替岗写入事件日志（原岗位/替补/时间）', !!subLog && !!subLog.ts);
 
   console.log('9. 原岗位不得再确认本条');
   confirmCue(prop);

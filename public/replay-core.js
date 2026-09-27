@@ -35,6 +35,14 @@ const ReplayCore = (() => {
     return Number.isFinite(n) ? n : fallback;
   }
 
+  // 岗位名可能与 Object.prototype 继承属性同名（constructor / __proto__ /
+  // toString 等）。以岗位名为键的表一律使用无原型字典：读写只触达自有键，
+  // 这些名称作为普通岗位原文保留——复盘按日志重建的确认 / 替岗结果与
+  // 服务端实时状态机（同样使用无原型字典）严格一致，JSON 快照不丢失记录。
+  function newDict() {
+    return Object.create(null);
+  }
+
   // 折叠内核状态。rounds / cues / orphanStale 等富模型字段与复盘页需要的
   // 现场镜像字段并存：镜像始终由当前轮次（s.currentRound）同步而来，保证
   // 复盘、对比、诊断看到的是同一份模型。
@@ -51,9 +59,9 @@ const ReplayCore = (() => {
       revision: 1,
       reason: null,
       attemptId: null,
-      confirmations: {}, // 岗位 -> { late }
+      confirmations: newDict(), // 岗位 -> { late }
       timedOut: [],
-      substitutions: {}, // 原岗位 -> { substitute }
+      substitutions: newDict(), // 原岗位 -> { substitute }
       paused: false,
       pauseReason: null,
       attempts: [], // 当前口令已封存的只读历史轮次（撤回 / 完成快照）
@@ -73,13 +81,13 @@ const ReplayCore = (() => {
   }
 
   function cloneConfirmations(map) {
-    const out = {};
+    const out = newDict();
     for (const [k, v] of Object.entries(map || {})) out[k] = { late: !!(v && v.late) };
     return out;
   }
 
   function cloneSubstitutions(map) {
-    const out = {};
+    const out = newDict();
     for (const [k, v] of Object.entries(map || {})) out[k] = { substitute: v.substitute };
     return out;
   }
@@ -153,9 +161,9 @@ const ReplayCore = (() => {
       deadlineT: null, // 由诊断消费者在收口时按暂停补偿计算
       cue,
       // ---- 轮次现场（复盘镜像读这两张表）----
-      confirmsMap: {}, // 岗位 -> { late }
+      confirmsMap: newDict(), // 岗位 -> { late }
       timedOut: [],
-      substitutionsMap: {}, // 原岗位 -> { substitute }
+      substitutionsMap: newDict(), // 原岗位 -> { substitute }
       paused: false,
       pauseReason: null,
       // ---- 诊断富模型 ----
@@ -567,9 +575,9 @@ const ReplayCore = (() => {
         s.phase = 'done';
         s.paused = false;
         s.pauseReason = null;
-        s.confirmations = {};
+        s.confirmations = newDict();
         s.timedOut = [];
-        s.substitutions = {};
+        s.substitutions = newDict();
         if (s.currentRound) {
           s.currentRound.paused = false;
           s.currentRound.pauseReason = null;

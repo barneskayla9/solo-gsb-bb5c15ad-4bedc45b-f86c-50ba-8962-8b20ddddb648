@@ -108,13 +108,14 @@
       // 有效目标含临时替岗：被接管的原岗位不再可确认，替补可确认
       const effTargets = state.effectiveTargets || (cue ? cue.targets : []);
       const targeted = active && cue && myPosition && effTargets.includes(myPosition);
-      const myConf = targeted && state.confirmations[myPosition];
+      const myConf = targeted && CueClient.own(state.confirmations, myPosition);
       const iTimedOut = targeted && state.timedOut.includes(myPosition);
       // 我作为替补接管了哪个原岗位；我的岗位被哪个替补接管
       const subbedFor = active && cue
         ? Object.keys(subs).find((from) => subs[from].substitute === myPosition)
         : null;
-      const replacedBy = active && cue && subs[myPosition] ? subs[myPosition].substitute : null;
+      const mySub = active && cue ? CueClient.own(subs, myPosition) : null;
+      const replacedBy = mySub ? mySub.substitute : null;
 
       // 横幅（暂停状态最优先：冻结期间各操作均被拒绝；其次是修订重发提示）
       banner.className = 'status-banner';

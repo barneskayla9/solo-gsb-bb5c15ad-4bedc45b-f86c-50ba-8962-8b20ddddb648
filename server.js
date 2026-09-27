@@ -20,6 +20,16 @@ const LEASE_SWEEP_MS = Math.min(10000, Math.max(200, Number(process.env.LEASE_SW
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
+// 岗位名由用户输入，可能与 Object.prototype 继承属性同名（constructor / __proto__ /
+// toString 等）。普通对象字面量以这些名称为键时：读取会命中继承属性（被误判为
+// 已确认 / 已替岗，有效目标被映射成空值），写入 __proto__ 甚至会改动对象原型
+// 而非建立自有键（JSON 快照与历史封存随之丢失该岗位记录）。
+// 因此所有以岗位名 / 口令 id 为键的记录一律使用无原型字典：读写只触达自有键，
+// 这些名称作为普通岗位原文保留，JSON.stringify 快照与 structuredClone 封存均完整。
+function newDict() {
+  return Object.create(null);
+}
+
 // ---------------------------------------------------------------------------
 // 会话状态（单场次，内存态；事件日志同时落盘到 data/events-<sessionId>.jsonl）
 // ---------------------------------------------------------------------------
@@ -39,10 +49,10 @@ const state = {
   currentIndex: -1,
   attemptId: null, // 当前轮次（某次激活/某次修订重发）的唯一凭证，岗位确认必须原样带回
   // 每个口令的修订档案：cueId -> { revision, currentReason, attempts: [只读历史轮次] }
-  cueHistory: {},
-  confirmations: {}, // 当前轮次：position -> { clientId, at, late, attemptId }
+  cueHistory: newDict(),
+  confirmations: newDict(), // 当前轮次：position -> { clientId, at, late, attemptId }
   timedOut: [], // 当前轮次：超时未确认的岗位
-  substitutions: {}, // 当前轮次的临时替岗：原岗位 -> { substitute, at }，仅对本轮次生效
+  substitutions: newDict(), // 当前轮次的临时替岗：原岗位 -> { substitute, at }，仅对本轮次生效
   cueStartedAt: null,
   deadline: null,
   // 暂停状态（仅当前轮次）：暂停时冻结剩余确认时长并撤销本轮计时器，恢复时按冻结余量重新计时
@@ -351,9 +361,9 @@ function startRound(cue, revision, startLog, { cancelOldTimer = true } = {}) {
   state.attemptId = crypto.randomUUID();
   state.phase = 'active';
   // 关键：每轮的确认/超时/替岗/暂停状态独立，绝不串入下一轮/下一条（下一条仍用导演编排的原目标）
-  state.confirmations = {};
+  state.confirmations = newDict();
   state.timedOut = [];
-  state.substitutions = {};
+  state.substitutions = newDict();
   state.paused = false;
   state.pauseReason = null;
   state.pausedAt = null;
@@ -467,9 +477,9 @@ function finishSequence() {
   state.phase = 'done';
   state.currentIndex = state.sequence.length;
   state.attemptId = null;
-  state.confirmations = {};
+  state.confirmations = newDict();
   state.timedOut = [];
-  state.substitutions = {};
+  state.substitutions = newDict();
   state.paused = false;
   state.pauseReason = null;
   state.pausedAt = null;
@@ -510,10 +520,10 @@ function resetSessionState() {
   state.phase = 'idle';
   state.currentIndex = -1;
   state.attemptId = null;
-  state.cueHistory = {};
-  state.confirmations = {};
+  state.cueHistory = newDict();
+  state.confirmations = newDict();
   state.timedOut = [];
-  state.substitutions = {};
+  state.substitutions = newDict();
   state.paused = false;
   state.pauseReason = null;
   state.pausedAt = null;
@@ -683,7 +693,7 @@ function handleMessage(ws, msg) {
       state.timeoutSec = normalizeTimeoutSec(data.timeoutSec);
       state.currentIndex = -1;
       state.attemptId = null;
-      state.cueHistory = {};
+      state.cueHistory = newDict();
       // idle 状态下发布全新序列：已发布版本 +1；理论上重置后草稿必已清空，此处兜底丢弃任何残留草稿
       state.publishedVersion += 1;
       state.draft = null;

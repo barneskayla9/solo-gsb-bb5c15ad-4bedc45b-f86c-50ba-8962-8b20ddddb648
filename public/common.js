@@ -71,6 +71,14 @@ const CueClient = (() => {
     return d.toLocaleTimeString('zh-CN', { hour12: false });
   }
 
+  // 岗位名可能与 Object.prototype 继承属性同名（constructor / __proto__ / toString 等）。
+  // 经 JSON 解析的状态快照是普通对象，直接 obj[name] 在键缺失时会读到继承值
+  // （未确认被误显为已确认、未替岗被误判已接管）。所有以岗位名为键的读取一律
+  // 经 own() 只取自有属性，使这些名称作为普通岗位保留原文。
+  function own(obj, key) {
+    return (obj && Object.prototype.hasOwnProperty.call(obj, key)) ? obj[key] : undefined;
+  }
+
   const EVENT_LABELS = {
     'sequence-set': '序列已保存',
     'session-start': '演出开始',
@@ -128,7 +136,10 @@ const CueClient = (() => {
     if (!hist || !Array.isArray(hist.attempts) || hist.attempts.length === 0) return '';
     return hist.attempts.slice().reverse().map((a) => {
       const subs = a.substitutions || {};
-      const effective = (cue.targets || []).map((t) => (subs[t] ? subs[t].substitute : t));
+      const effective = (cue.targets || []).map((t) => {
+        const sub = own(subs, t);
+        return sub ? sub.substitute : t;
+      });
       const confs = a.confirmations || {};
       const confirmed = Object.keys(confs);
       const timedOut = a.timedOut || [];
@@ -178,5 +189,5 @@ const CueClient = (() => {
       `<span class="vchip vchip-pub">🔒 已发布序列版本：v${pub}</span>${draftChip}</div>`;
   }
 
-  return { connect, getClientId, fmtTime, renderLog, renderAttempts, renderVersionBar, escapeHtml };
+  return { connect, getClientId, fmtTime, own, renderLog, renderAttempts, renderVersionBar, escapeHtml };
 })();
